@@ -341,7 +341,9 @@ TfLiteStatus EvalCalibration(
       const float* input_ptr = GetTensorData<float>(input) + t_rel * input_step;
       const float* aux_input_ptr = nullptr;
       if (aux_input) {
-        aux_input_ptr = GetTensorData<float>(aux_input) + t_rel * input_step;
+        const int aux_input_step = n_batch * aux_input_size;
+        aux_input_ptr =
+            GetTensorData<float>(aux_input) + t_rel * aux_input_step;
       }
       float* output_ptr_time =
           GetTensorData<float>(output) + t_rel * output_step + output_offset;
@@ -391,8 +393,9 @@ TfLiteStatus EvalCalibration(
             GetTensorData<float>(input) + time_offset * input_step;
         const float* aux_input_ptr = nullptr;
         if (aux_input) {
+          const int aux_input_step = aux_input_size;
           aux_input_ptr =
-              GetTensorData<float>(aux_input) + time_offset * input_step;
+              GetTensorData<float>(aux_input) + time_offset * aux_input_step;
         }
         float* output_ptr = GetTensorData<float>(output) +
                             time_offset * output_step + output_offset;
