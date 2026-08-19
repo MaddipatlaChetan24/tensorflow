@@ -25,6 +25,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "third_party/gpus/cuda/extras/CUPTI/include/cupti_activity.h"
 #include "third_party/gpus/cuda/extras/CUPTI/include/cupti_callbacks.h"
 #include "third_party/gpus/cuda/extras/CUPTI/include/cupti_driver_cbid.h"
@@ -145,10 +146,14 @@ class CuptiTracer {
   // Selects and prepares the subscriber for the next profiling session before
   // the profiler takes its GPU timestamp anchor.
   absl::Status PrepareForProfilerStart(const CuptiTracerOptions& option);
-  uint64_t GetTimestampForSubscriber() const;
+  absl::StatusOr<uint64_t> GetTimestampForSubscriber() const;
   static int NumGpus();
   // Returns the error (if any) when using libcupti.
   static std::string ErrorIfAny();
+
+  // Enables activity hardware events tracing using HES (Hardware Event System).
+  // Once enabled, it stays enabled for the process lifetime.
+  static absl::Status EnableHES();
 
   // Returns true if the number of annotation strings is too large. The input
   // count is the per-thread count.
