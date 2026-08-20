@@ -37,6 +37,7 @@ limitations under the License.
 #include "xla/hlo/builder/xla_builder.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_instruction_utils.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
@@ -6594,6 +6595,84 @@ ENTRY AsyncDoneZeroOperandsRejected {
                                        "AsyncDone")));
 }
 
+TEST_F(HloParserTest, AsyncDoneAsOperandToAsyncUpdateRejected) {
+  const char* const hlo_string = R"(
+HloModule Module
+
+async_computation {
+  p0 = f32[2,3] parameter(0)
+  ROOT custom-call = f32[3,2] custom-call(p0), custom_call_target="foo"
+}
+
+ENTRY AsyncDoneAsOperandToAsyncUpdateRejected {
+  p0 = f32[2,3] parameter(0)
+  async-start = ((f32[2,3]), f32[3,2], s32[]) async-start(p0), calls=async_computation
+  async-done = f32[3,2] async-done(async-start)
+  ROOT async-update = ((f32[2,3]), f32[3,2], s32[]) async-update(async-done)
+}
+  )";
+  EXPECT_THAT(
+      ParseAndReturnUnverifiedModule(hlo_string).status(),
+      absl_testing::StatusIs(
+          tsl::error::INVALID_ARGUMENT,
+          HasSubstr(
+              "AsyncUpdate and AsyncDone cannot have AsyncDone as operand.")));
+}
+
+TEST_F(HloParserTest, AsyncDoneAsOperandToAsyncDoneRejected) {
+  const char* const hlo_string = R"(
+HloModule Module
+
+async_computation {
+  p0 = f32[2,3] parameter(0)
+  ROOT custom-call = f32[3,2] custom-call(p0), custom_call_target="foo"
+}
+
+ENTRY AsyncDoneAsOperandToAsyncDoneRejected {
+  p0 = f32[2,3] parameter(0)
+  async-start = ((f32[2,3]), f32[3,2], s32[]) async-start(p0), calls=async_computation
+  async-done.0 = f32[3,2] async-done(async-start)
+  ROOT async-done.1 = f32[3,2] async-done(async-done.0)
+}
+  )";
+  EXPECT_THAT(
+      ParseAndReturnUnverifiedModule(hlo_string).status(),
+      absl_testing::StatusIs(
+          tsl::error::INVALID_ARGUMENT,
+          HasSubstr(
+              "AsyncUpdate and AsyncDone cannot have AsyncDone as operand.")));
+}
+
+TEST_F(HloParserTest, AsyncDoneWithTransparentIntermediaries) {
+  const char* const hlo_string = R"(
+HloModule Module
+
+async_computation {
+  p0 = f32[2,3] parameter(0)
+  ROOT custom-call = f32[3,2] custom-call(p0), custom_call_target="foo"
+}
+
+ENTRY AsyncDoneWithTransparentIntermediaries {
+  p0 = f32[2,3] parameter(0)
+  async-start = ((f32[2,3]), f32[3,2], s32[]) async-start(p0), calls=async_computation
+  barrier = ((f32[2,3]), f32[3,2], s32[]) opt-barrier(async-start)
+  tup = (((f32[2,3]), f32[3,2], s32[])) tuple(barrier)
+  gte = ((f32[2,3]), f32[3,2], s32[]) get-tuple-element(tup), index=0
+  copy = ((f32[2,3]), f32[3,2], s32[]) copy(gte)
+  ROOT async-done = f32[3,2] async-done(copy)
+}
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnUnverifiedModule(hlo_string));
+  HloInstruction* done = module->entry_computation()->root_instruction();
+  EXPECT_EQ(done->opcode(), HloOpcode::kAsyncDone);
+  const HloInstruction* producer =
+      hlo_instruction_utils::async::FindAsyncProducer(done->operand(0));
+  ASSERT_NE(producer, nullptr);
+  EXPECT_EQ(producer->opcode(), HloOpcode::kAsyncStart);
+  EXPECT_EQ(hlo_instruction_utils::async::FindAsyncStart(done), producer);
+}
+
 TEST_F(HloParserTest, AsyncUpdateWithSyntaxSugarWrongOp) {
   const char* const hlo_string = R"(
 HloModule AsyncUpdateWithSyntaxSugarWrongOp
@@ -8319,6 +8398,16 @@ ENTRY main {
   EXPECT_EQ(aliasing[0].first, ShapeIndex({2}));
   EXPECT_EQ(aliasing[0].second.first, 0);                 // operand 0
   EXPECT_EQ(aliasing[0].second.second, ShapeIndex({2}));  // index 2
+}
+
+TEST_F(HloParserTest, AsyncDoneWithFrontendAttributes) {
+  const char* const hlo_string =
+      R"(%all-to-all-done.3 = bf16[1,2,4,1,1024]{4,2,3,0,1:T(4,128)(2,1)S(1)} async-done(((bf16[1,2,4,1,1024]{4,2,3,0,1:T(4,128)(2,1)}), bf16[1,2,4,1,1024]{4,2,3,0,1:T(4,128)(2,1)S(1)}, u32[]{:S(2)}, u32[]{:S(2)}) %all-to-all-start.3), frontend_attributes={is_spmd_generated="true"})";
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo_string));
+  auto root = module->entry_computation()->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kAsyncDone);
+  EXPECT_EQ(root->frontend_attributes().map_size(), 1);
+  EXPECT_EQ(root->frontend_attributes().map().at("is_spmd_generated"), "true");
 }
 }  // namespace
 }  // namespace xla
