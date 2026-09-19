@@ -85,6 +85,17 @@ def _heartbeat(
         logging.warning('Heartbeat failure %d, %d more until limit: %s',
                         _failure_count,
                         _CONSECUTIVE_FAILURES_LIMIT - _failure_count, e)
+        # `signal` was never reassigned by a successful `all_reduce` call
+        # above -- it still holds its pre-try value (all zeros except at
+        # this worker's own index). Falling through to the consistency
+        # check below would compare that stale, un-reduced local array
+        # against `token`, which is false for any `num_tasks` > 1
+        # regardless of whether the other workers are actually still in
+        # sync, immediately triggering `logging.fatal` on this very first
+        # transient failure and completely defeating the point of
+        # `_CONSECUTIVE_FAILURES_LIMIT`'s retry tolerance. `continue` so
+        # a failure under the limit correctly retries next period instead.
+        continue
       else:
         logging.fatal('Heartbeat failure %d, limit of %d reached: %s',
                       _failure_count, _CONSECUTIVE_FAILURES_LIMIT, e)
