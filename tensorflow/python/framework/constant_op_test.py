@@ -1,4 +1,4 @@
-# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,140 +12,138 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for tensorflow.python.framework.constant_op."""
 
-from absl.testing import parameterized
-import numpy as np
-
-from google.protobuf import text_format
-
-from tensorflow.core.framework import graph_pb2
-from tensorflow.python.eager import def_function
-from tensorflow.python.framework import constant_op
-from tensorflow.python.framework import dtypes
-from tensorflow.python.framework import importer
-from tensorflow.python.framework import ops
-from tensorflow.python.ops import gradients_impl
-from tensorflow.python.ops.parallel_for import control_flow_ops
-from tensorflow.python.platform import test
+"""Tests for c_api utils."""
+import gc
+from tensorflow.python.framework import c_api_util
+from tensorflow.python.framework import test_util
+from tensorflow.python.platform import googletest
 
 
-class ConstantOpTest(test.TestCase, parameterized.TestCase):
+class ApiDefMapTest(test_util.TensorFlowTestCase):
 
-  @parameterized.parameters(
-      dtypes.bfloat16,
-      dtypes.complex128,
-      dtypes.complex64,
-      dtypes.double,
-      dtypes.float16,
-      dtypes.float32,
-      dtypes.float64,
-      dtypes.half,
-      dtypes.int16,
-      dtypes.int32,
-      dtypes.int64,
-      dtypes.int8,
-      dtypes.qint16,
-      dtypes.qint32,
-      dtypes.qint8,
-      dtypes.quint16,
-      dtypes.quint8,
-      dtypes.uint16,
-      dtypes.uint32,
-      dtypes.uint64,
-      dtypes.uint8,
-  )
-  def test_convert_string_to_number(self, dtype):
-    with self.assertRaises(TypeError):
-      constant_op.constant("hello", dtype)
+  def testApiDefMapOpNames(self):
+    api_def_map = c_api_util.ApiDefMap()
+    self.assertIn("Add", api_def_map.op_names())
 
-  def _make_graph_def(self, text):
-    ret = graph_pb2.GraphDef()
-    text_format.Parse(text, ret)
-    return ret
+  def testApiDefMapGet(self):
+    api_def_map = c_api_util.ApiDefMap()
+    op_def = api_def_map.get_op_def("Add")
+    self.assertEqual(op_def.name, "Add")
+    api_def = api_def_map.get_api_def("Add")
+    self.assertEqual(api_def.graph_op_name, "Add")
 
-  def test_eager_const_xla(self):
+  def testApiDefMapGetInvalidOp(self):
+    api_def_map = c_api_util.ApiDefMap()
+    with self.assertRaises(ValueError):
+      api_def_map.get_api_def("InvalidOperationName")
 
-    @def_function.function(jit_compile=True)
-    def f_using_eagerconst(x):
-      graph_def = self._make_graph_def("""
-         node { name: 'x' op: 'Const'
-           attr { key: 'dtype' value { type: DT_FLOAT } }
-           attr { key: 'value' value { tensor {
-             dtype: DT_FLOAT tensor_shape {} float_val: NaN } } } }
-         node { name: 'const' op: '_EagerConst' input: 'x:0'
-                attr { key: 'T' value { type: DT_FLOAT } }}""")
-      x_id = importer.import_graph_def(
-          graph_def,
-          input_map={"x:0": x},
-          return_elements=["const"],
-          name="import")[0].outputs[0]
-      return x_id
+  def testApiDefMapPutThenGet(self):
+    api_def_map = c_api_util.ApiDefMap()
+    api_def_text = """
+op {
+  graph_op_name: "Add"
+  summary: "Returns x + y element-wise."
+  description: <<END
+*NOTE*: `Add` supports broadcasting. `AddN` does not. More about broadcasting
+[here](http://docs.scipy.org/doc/numpy/user/basics.broadcasting.html)
+END
+}
+"""
+    api_def_map.put_api_def(api_def_text)
+    api_def = api_def_map.get_api_def("Add")
+    self.assertEqual(api_def.graph_op_name, "Add")
+    self.assertEqual(api_def.summary, "Returns x + y element-wise.")
 
-    self.assertAllClose(3.14, f_using_eagerconst(constant_op.constant(3.14)))
 
-  def test_np_array_memory_not_shared(self):
-    # An arbitrarily large loop number to test memory sharing
-    for _ in range(10000):
-      x = np.arange(10)
-      xt = constant_op.constant(x)
-      x[3] = 42
-      # Changing the input array after `xt` is created should not affect `xt`
-      self.assertEqual(xt.numpy()[3], 3)
+class UniquePtrTest(test_util.TensorFlowTestCase):
 
-  def test_eager_const_grad_error(self):
+  def setUp(self):
 
-    @def_function.function
-    def f_using_eagerconst():
-      x = constant_op.constant(1.)
-      graph_def = self._make_graph_def("""
-         node { name: 'x' op: 'Placeholder'
-                attr { key: 'dtype' value { type: DT_FLOAT } }}
-         node { name: 'const' op: '_EagerConst' input: 'x:0'
-                attr { key: 'T' value { type: DT_FLOAT } }}""")
-      x_id = importer.import_graph_def(
-          graph_def,
-          input_map={"x:0": x},
-          return_elements=["const"],
-          name="import")[0].outputs[0]
-      gradients_impl.gradients(x_id, x)
-      return x_id
+    super(UniquePtrTest, self).setUp()
 
-    with self.assertRaisesRegex(AssertionError, "Please file a bug"):
-      f_using_eagerconst()
+    class MockClass:
 
-  def test_eager_const_pfor(self):
+      def __init__(self):
+        self.deleted = False
 
-    @def_function.function
-    def f_using_eagerconst():
+    def deleter(obj):
+      obj.deleted = True
 
-      def vec_fn(x):
-        graph_def = self._make_graph_def("""
-           node { name: 'x' op: 'Const'
-             attr { key: 'dtype' value { type: DT_FLOAT } }
-             attr { key: 'value' value { tensor {
-               dtype: DT_FLOAT tensor_shape {} float_val: 3.14 } } } }
-           node { name: 'const' op: '_EagerConst' input: 'x:0'
-                  attr { key: 'T' value { type: DT_FLOAT } }}""")
-        return importer.import_graph_def(
-            graph_def,
-            input_map={"x:0": x},
-            return_elements=["const"],
-            name="import")[0].outputs[0]
+    self.obj = MockClass()
+    self.deleter = deleter
 
-      return control_flow_ops.vectorized_map(
-          vec_fn, constant_op.constant([1., 2.]), fallback_to_while_loop=False)
+  def testLifeCycle(self):
+    self.assertFalse(self.obj.deleted)
 
-    self.assertAllClose([1., 2.], f_using_eagerconst())
+    a = c_api_util.UniquePtr(name="mock", deleter=self.deleter, obj=self.obj)
 
-  def test_eager_tensor_numpy_array_protocol_scalar(self):
-    t = constant_op.constant(42.0)
-    arr = t.__array__()
-    self.assertIsInstance(arr, np.ndarray)
-    self.assertEqual(arr.shape, ())
-    self.assertEqual(arr.item(), 42.0)
+    with a.get() as obj:
+      self.assertIs(obj, self.obj)
+
+    del a
+    gc.collect()
+    self.assertTrue(self.obj.deleted)
+
+  def testSafeUnderRaceCondition(self):
+    self.assertFalse(self.obj.deleted)
+
+    a = c_api_util.UniquePtr(name="mock", deleter=self.deleter, obj=self.obj)
+
+    with a.get() as obj:
+      self.assertIs(obj, self.obj)
+      # The del below mimics a potential race condition.
+      # 'a' could be owned by a different thread, and this thread not
+      # necessarily hold a long-term reference to a.
+      del a
+      gc.collect()
+      self.assertFalse(obj.deleted)
+
+    gc.collect()
+    self.assertTrue(self.obj.deleted)
+
+  def testRaiseAfterDeleted(self):
+    self.assertFalse(self.obj.deleted)
+
+    a = c_api_util.UniquePtr(name="mock", deleter=self.deleter, obj=self.obj)
+
+    # The __del__ below mimics a partially started deletion, potentially
+    # started from another thread.
+    # 'a' could be owned by a different thread, and this thread not
+    # necessarily hold a long-term reference to a.
+    a.__del__()
+    self.assertTrue(self.obj.deleted)
+
+    with self.assertRaisesRegex(c_api_util.AlreadyGarbageCollectedError,
+                                "MockClass"):
+      with a.get():
+        pass
+
+    gc.collect()
+    self.assertTrue(self.obj.deleted)
+
+
+class ScopedTFBufferTest(test_util.TensorFlowTestCase):
+
+  def testDeleteRunsUnderNormalConditions(self):
+    buf = c_api_util.ScopedTFBuffer(b"test")
+    del buf
+    gc.collect()
+
+  def testDeleteGuardsAgainstNoneCApi(self):
+    # Regression test: __del__ used to call c_api.TF_DeleteBuffer without
+    # guarding against c_api being None, which happens during interpreter
+    # shutdown. Call __del__ directly (rather than relying on `del` +
+    # garbage collection) since CPython suppresses exceptions raised
+    # inside a GC-triggered __del__ instead of propagating them.
+    buf = c_api_util.ScopedTFBuffer(b"test")
+    original_c_api = c_api_util.c_api
+    try:
+      c_api_util.c_api = None
+      buf.__del__()  # should not raise
+    finally:
+      c_api_util.c_api = original_c_api
 
 
 if __name__ == "__main__":
-  ops.enable_eager_execution()
-  test.main()
+  googletest.main()
