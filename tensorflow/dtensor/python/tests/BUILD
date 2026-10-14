@@ -809,6 +809,19 @@ dtensor_test(
 )
 
 dtensor_test(
+    name = "d_random_test",
+    srcs = ["d_random_test.py"],
+    main = "d_random_test.py",
+    deps = [
+        ":test_util",
+        "//tensorflow/dtensor/python:d_random",
+        "//tensorflow/dtensor/python:layout",
+        "//tensorflow/python/framework:dtypes",
+        "//tensorflow/python/framework:ops",
+    ],
+)
+
+dtensor_test(
     name = "spmd_test",
     srcs = ["spmd_test.py"],
     additional_backends = [TPU_V3_DONUT_BACKEND],
