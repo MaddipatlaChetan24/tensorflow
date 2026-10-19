@@ -62,6 +62,7 @@ limitations under the License.
 #include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
+#include "tsl/platform/platform.h"
 
 namespace xla {
 namespace ifrt {
@@ -629,7 +630,9 @@ tsl::Future<> PjRtArray::GetReadyFuture() const {
 tsl::Future<> PjRtArray::Delete() {
   DCHECK(this);
   for (auto& buffer : pjrt_buffers_) {
-    buffer->Delete();
+    if (buffer != nullptr) {
+      buffer->Delete();
+    }
   }
   is_deleted_ = true;
   // TODO(hyeontaek): Return a correct future.
@@ -638,10 +641,15 @@ tsl::Future<> PjRtArray::Delete() {
 
 bool PjRtArray::IsDeleted() const {
   DCHECK(this);
-  // TODO(hyeontaek): This may be incorrect if PjRtBuffers are shared and a
-  // portion of pjrt_buffers_ is deleted or not deleted.
-  return is_deleted_ ||
-         (!pjrt_buffers_.empty() && pjrt_buffers_.front()->IsDeleted());
+  if (is_deleted_) {
+    return true;
+  }
+  for (const auto& buffer : pjrt_buffers_) {
+    if (buffer == nullptr || buffer->IsDeleted()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::string PjRtArray::DebugString() const {
@@ -674,16 +682,16 @@ std::string PjRtArray::DebugString() const {
 
 absl::StatusOr<std::shared_ptr<const xla::PjRtLayout>> PjRtArray::pjrt_layout()
     const {
-#ifndef NDEBUG
-  for (int i = 1; i < pjrt_buffers_.size(); ++i) {
-    std::shared_ptr<const xla::PjRtLayout> layout_i =
-        pjrt_buffers_[i]->layout();
-    DCHECK(*pjrt_buffers_[0]->layout() == *layout_i)
-        << "PjRtArray has mismatched layouts across shards! "
-        << "shard 0: " << pjrt_buffers_[0]->layout()->ToString() << ", shard "
-        << i << ": " << layout_i->ToString();
+  if constexpr (tsl::kIsDebugBuild) {
+    for (int i = 1; i < pjrt_buffers_.size(); ++i) {
+      std::shared_ptr<const xla::PjRtLayout> layout_i =
+          pjrt_buffers_[i]->layout();
+      DCHECK(*pjrt_buffers_[0]->layout() == *layout_i)
+          << "PjRtArray has mismatched layouts across shards! "
+          << "shard 0: " << pjrt_buffers_[0]->layout()->ToString() << ", shard "
+          << i << ": " << layout_i->ToString();
+    }
   }
-#endif
   if (layout_ == nullptr) {
     return nullptr;
   }
