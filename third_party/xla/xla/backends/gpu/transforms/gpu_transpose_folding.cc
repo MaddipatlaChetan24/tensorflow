@@ -157,7 +157,8 @@ absl::StatusOr<bool> GpuTransposeFolding::RunImpl(
       if (instruction->opcode() == HloOpcode::kDot) {
         ABSL_ASSIGN_OR_RETURN(bool folded, FoldIntoDot(instruction, gpu_version_));
         changed |= folded;
-      } else if (instruction->opcode() == HloOpcode::kConvolution) {
+      } else if (fold_into_convolutions_ &&
+                 instruction->opcode() == HloOpcode::kConvolution) {
         ABSL_ASSIGN_OR_RETURN(bool folded, FoldIntoConvolution(instruction));
         changed |= folded;
       }
