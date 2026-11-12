@@ -277,7 +277,73 @@ setattr(np_arrays.ndarray, '_matmul', matmul)
 @tf_export.tf_export('experimental.numpy.tensordot', v1=[])
 @np_utils.np_doc('tensordot')
 def tensordot(a, b, axes=2):
-  return _bin_op(lambda a, b: math_ops.tensordot(a, b, axes=axes), a, b)
+  def f(a, b):  # pylint: disable=missing-docstring
+    # NumPy raises IndexError: tuple index out of range (its own internal
+    # indexing over `axes`) before any computation on out-of-bounds axes.
+    # The backend `tensordot` instead normalizes the raw entries itself and
+    # only checks an integer count against the first input: a too-large
+    # entry fails with a bare `IndexError` while indexing the static shape,
+    # and a negative out-of-bounds entry leaves a leftover negative value
+    # in the transpose `perm`, which fails in `array_ops.transpose` with a
+    # perm error unrelated to `axes`.
+    # Validate statically-known ranks and Python-int entries against NumPy's
+    # bounds up front; tensor axes or unknown ranks (e.g. `@tf.function` with
+    # an unspecified input signature) behave exactly as before, and no graph
+    # ops are added on the eager path.
+    norm_axes = None
+    if isinstance(axes, (list, tuple)) and len(axes) == 2:
+      a_entries, b_entries = axes
+      # A bare integer on one side names that side's single contraction
+      # axis, as in NumPy's mixed form `axes=(1, [0])`.
+      if isinstance(a_entries, (int, np.integer)):
+        a_entries = (a_entries,)
+      if isinstance(b_entries, (int, np.integer)):
+        b_entries = (b_entries,)
+      if isinstance(a_entries, (tuple, list)) and isinstance(
+          b_entries, (tuple, list)
+      ):
+        # Forward the normalized form so the backend does not have to
+        # re-derive it: `math_ops.tensordot` only wraps each bare integer
+        # when both sides are integers, so a mixed form would otherwise
+        # fail on `len()` of an int.
+        norm_axes = (a_entries, b_entries)
+      else:
+        # Tensor axes: leave validation to dynamic behavior as before.
+        a_entries, b_entries = (), ()
+      for entries, t in ((a_entries, a), (b_entries, b)):
+        maybe_rank = t.shape.rank
+        if maybe_rank is None:
+          continue
+        for entry in entries:
+          if isinstance(entry, (int, np.integer)) and not (
+              -maybe_rank <= int(entry) < maybe_rank
+          ):
+            raise ValueError(
+                f'Argument `axes` (received axes={entry}) is out of '
+                f'bounds for input with shape {t.shape} of rank '
+                f'{maybe_rank}.'
+            )
+    elif isinstance(axes, (int, np.integer)):
+      # Contraction over the last N axes of `a` and first N axes of `b`.
+      # NumPy errors when N exceeds either input's rank, but treats any
+      # negative N as an empty contraction (an outer product):
+      # np.tensordot(a, b, -1) has shape a.shape + b.shape.
+      maybe_rank_a = a.shape.rank
+      maybe_rank_b = b.shape.rank
+      num_axes = int(axes)
+      if num_axes < 0:
+        return math_ops.tensordot(a, b, axes=0)
+      for maybe_rank, t in ((maybe_rank_a, a), (maybe_rank_b, b)):
+        if maybe_rank is not None and num_axes > maybe_rank:
+          raise ValueError(
+              f'Argument `axes` (received axes={axes}) is out of bounds '
+              f'for input with shape {t.shape} of rank {maybe_rank}.'
+          )
+    if norm_axes is not None:
+      return math_ops.tensordot(a, b, axes=norm_axes)
+    return math_ops.tensordot(a, b, axes=axes)
+
+  return _bin_op(f, a, b)
 
 
 @tf_export.tf_export('experimental.numpy.inner', v1=[])
@@ -416,8 +482,16 @@ def power(x1, x2):
 
 @tf_export.tf_export('experimental.numpy.float_power', v1=[])
 @np_utils.np_doc('float_power')
-def float_power(x1, x2):
-  return power(x1, x2)
+def float_power(x1, x2):  # pylint: disable=missing-function-docstring
+  # Unlike `power`, NumPy always computes `float_power` in the widest float
+  # (or complex) type, which is what lets integers be raised to negative
+  # powers.
+  x1, x2 = np_array_ops._promote_dtype_binary(x1, x2)  # pylint: disable=protected-access
+  if x1.dtype.is_complex:
+    dtype = np_utils.result_type(complex)
+  else:
+    dtype = np_utils.result_type(float)
+  return power(math_ops.cast(x1, dtype), math_ops.cast(x2, dtype))
 
 
 @tf_export.tf_export('experimental.numpy.arctan2', v1=[])
@@ -882,6 +956,10 @@ def floor(x):
 @tf_export.tf_export('experimental.numpy.conj', v1=[])
 @np_utils.np_doc('conj')
 def conj(x):
+  x = np_array_ops.asarray(x)
+  if x.dtype == dtypes.bool:
+    # `math_ops.conj` rejects bool, which has no imaginary part to negate.
+    return x
   return _scalar(math_ops.conj, x)
 
 
@@ -998,7 +1076,11 @@ def deg2rad(x):
 @tf_export.tf_export('experimental.numpy.rad2deg', v1=[])
 @np_utils.np_doc('rad2deg')
 def rad2deg(x):
-  return x * (180.0 / np.pi)
+
+  def f(x):
+    return x * (180.0 / np.pi)
+
+  return _scalar(f, x, True)
 
 
 _tf_float_types = [
@@ -1046,7 +1128,7 @@ def cbrt(x):
 @tf_export.tf_export('experimental.numpy.conjugate', v1=[])
 @np_utils.np_doc('conjugate', link=np_utils.AliasOf('conj'))
 def conjugate(x):
-  return _scalar(math_ops.conj, x)
+  return conj(x)
 
 
 @tf_export.tf_export('experimental.numpy.exp2', v1=[])
@@ -1076,13 +1158,20 @@ def fix(x):
 @tf_export.tf_export('experimental.numpy.iscomplex', v1=[])
 @np_utils.np_doc('iscomplex')
 def iscomplex(x):
-  return np_array_ops.imag(x) != 0
+  x = np_array_ops.asarray(x)
+  if x.dtype.is_complex:
+    return np_array_ops.imag(x) != 0
+  # Comparing against 0 would fail for bool, so answer from the dtype.
+  return np_array_ops.zeros_like(x, dtype=dtypes.bool)
 
 
 @tf_export.tf_export('experimental.numpy.isreal', v1=[])
 @np_utils.np_doc('isreal')
 def isreal(x):
-  return np_array_ops.imag(x) == 0
+  x = np_array_ops.asarray(x)
+  if x.dtype.is_complex:
+    return np_array_ops.imag(x) == 0
+  return np_array_ops.ones_like(x, dtype=dtypes.bool)
 
 
 @tf_export.tf_export('experimental.numpy.iscomplexobj', v1=[])
@@ -1400,6 +1489,32 @@ def logical_not(x):
   return math_ops.logical_not(x)
 
 
+def _validate_destination_axis(axis, start, stop):
+  """Validates the destination axis for linspace and geomspace."""
+  # NumPy raises AxisError for an out-of-bounds destination axis instead of
+  # letting the backend fail with a confusing error. In NumPy the samples
+  # array has rank `bd + 1`, where `bd` is the broadcast rank of `start` and
+  # `stop`, and valid destination axes are [-(bd + 1), bd] - exactly the
+  # domain the backend's `expand_dims`/`moveaxis` accepts. Only
+  # statically-known ranks and Python-int `axis` values are checked; unknown
+  # ranks or tensor axes, e.g. `@tf.function` with an unspecified input
+  # signature, behave exactly as before, and no graph ops are added on the
+  # eager path.
+  if isinstance(axis, (int, np.integer)):
+    maybe_bd = start.shape.rank
+    maybe_bd_stop = stop.shape.rank
+    if maybe_bd is not None and maybe_bd_stop is not None:
+      dimension = max(maybe_bd, maybe_bd_stop) + 1
+      normalized = int(axis)
+      if normalized < 0:
+        normalized += dimension
+      if normalized < 0 or normalized >= dimension:
+        raise ValueError(
+            f'destination: axis {axis} is out of bounds for array of '
+            f'dimension {dimension}'
+        )
+
+
 @tf_export.tf_export('experimental.numpy.linspace', v1=[])
 @np_utils.np_doc('linspace')
 def linspace(  # pylint: disable=missing-docstring
@@ -1431,6 +1546,8 @@ def linspace(  # pylint: disable=missing-docstring
         f'Received: num={num}'
     )
   step = ops.convert_to_tensor(np.nan)
+  _validate_destination_axis(axis, start, stop)
+
   if endpoint:
     result = math_ops.linspace(start, stop, num, axis=axis)
     if num > 1:
@@ -1470,6 +1587,36 @@ def logspace(start, stop, num=50, endpoint=True, base=10.0, dtype=None, axis=0):
   return result
 
 
+def _geomspace_log10(x):
+  """`log10(x)` refined with one Newton step.
+
+  `log(x) / log(10)` is regularly an ulp or two off, e.g. it gives
+  2.9999999999999996 for x = 1000, and `geomspace` spreads that error over
+  every sample. One Newton step on `10**y - x` brings it back in line with
+  NumPy's `log10`. It is only applied to the (usually scalar) endpoints, so the
+  extra `pow` is cheap.
+
+  Args:
+    x: A tensor. Only real floating-point inputs are refined; anything else,
+      including complex inputs, goes to `log10` unchanged since `is_finite` has
+      no complex kernel.
+
+  Returns:
+    log10(x), with the same dtype as `x` for real floating-point inputs.
+  """
+  if not x.dtype.is_floating:
+    return log10(x)
+  # Stay in `x.dtype`: under NumPy-style promotion `log10(x)` can come back as
+  # float64 for a float32 `x`, which `pow` would then reject.
+  ten = constant_op.constant(10, dtype=x.dtype)
+  ln10 = math_ops.log(ten)
+  y = math_ops.log(x) / ln10
+  correction = (x - math_ops.pow(ten, y)) / (x * ln10)
+  # The correction is NaN for zero, negative and non-finite inputs, whose
+  # logarithm is left as is.
+  return array_ops.where_v2(math_ops.is_finite(correction), y + correction, y)
+
+
 @tf_export.tf_export('experimental.numpy.geomspace', v1=[])
 @np_utils.np_doc('geomspace')
 def geomspace(start, stop, num=50, endpoint=True, dtype=None, axis=0):  # pylint: disable=missing-docstring
@@ -1483,19 +1630,37 @@ def geomspace(start, stop, num=50, endpoint=True, dtype=None, axis=0):  # pylint
   computation_dtype = np.promote_types(dtype.as_numpy_dtype, np.float32)
   start = np_array_ops.asarray(start, dtype=computation_dtype)
   stop = np_array_ops.asarray(stop, dtype=computation_dtype)
+  _validate_destination_axis(axis, start, stop)
   # follow the numpy geomspace convention for negative and complex endpoints
   start_sign = 1 - np_array_ops.sign(np_array_ops.real(start))
   stop_sign = 1 - np_array_ops.sign(np_array_ops.real(stop))
   signflip = 1 - start_sign * stop_sign // 2
   res = signflip * logspace(
-      log10(signflip * start),
-      log10(signflip * stop),
+      _geomspace_log10(signflip * start),
+      _geomspace_log10(signflip * stop),
       num,
       endpoint=endpoint,
       base=10.0,
       dtype=computation_dtype,
       axis=0,
   )
+  if num > 0:
+    # Like NumPy, make the endpoints match `start` and `stop` exactly. The
+    # round trip through log10 and pow does not reproduce them, and casting
+    # to an integer `dtype` would then truncate e.g. 999.9999999999991 to 999.
+    sample_shape = array_ops.shape(res)[1:]
+    first = array_ops.expand_dims(
+        array_ops.broadcast_to(math_ops.cast(start, res.dtype), sample_shape),
+        0,
+    )
+    if endpoint and num > 1:
+      last = array_ops.expand_dims(
+          array_ops.broadcast_to(math_ops.cast(stop, res.dtype), sample_shape),
+          0,
+      )
+      res = array_ops.concat([first, res[1:-1], last], axis=0)
+    else:
+      res = array_ops.concat([first, res[1:]], axis=0)
   if axis != 0:
     res = np_array_ops.moveaxis(res, 0, axis)
   return math_ops.cast(res, dtype)
@@ -1803,23 +1968,10 @@ def trace(a, offset=0, axis1=0, axis2=1, dtype=None):  # pylint: disable=missing
   if dtype:
     dtype = np_utils.result_type(dtype)
   a = np_array_ops.asarray(a, dtype)
-
-  if offset == 0:
-    a_shape = a.shape
-    if a_shape.rank is not None:
-      rank = len(a_shape)
-      # Guard `rank >= 2` so the fast path never routes a rank-1 (or
-      # rank-0) input with negative axes to `math_ops.trace`/
-      # `matrix_diag_part`, which require rank >= 2: e.g. on a rank-1
-      # input, `axis1 == -2 or axis1 == rank - 2` erroneously holds for
-      # the out-of-bounds default `axis1=-2`.
-      if (
-          rank >= 2
-          and (axis1 == -2 or axis1 == rank - 2)
-          and (axis2 == -1 or axis2 == rank - 1)
-      ):
-        return math_ops.trace(a)
-
+  # There is deliberately no `math_ops.trace` shortcut here: it sums in the
+  # input dtype, so small integer inputs would overflow and bool inputs would
+  # fail, whereas `sum` promotes them the way NumPy does. `diagonal` already
+  # takes the `matrix_diag_part` fast path for the last two axes.
   a = np_array_ops.diagonal(a, offset, axis1, axis2)
   return np_array_ops.sum(a, -1, dtype)
 
@@ -1939,7 +2091,7 @@ def _enable_numpy_methods(tensor_class):
   setattr(tensor_class, 'reshape', np_array_ops._reshape_method_wrapper)  # pylint: disable=protected-access
   setattr(tensor_class, 'ravel', np_array_ops.ravel)
   setattr(tensor_class, 'clip', clip)
-  setattr(tensor_class, 'astype', math_ops.cast)
+  setattr(tensor_class, 'astype', np_array_ops._cast)  # pylint: disable=protected-access
   setattr(tensor_class, '__round__', np_array_ops.around)
   setattr(tensor_class, 'max', np_array_ops.amax)
   setattr(tensor_class, 'mean', np_array_ops.mean)

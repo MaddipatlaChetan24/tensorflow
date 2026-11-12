@@ -145,7 +145,7 @@ cuda_py_strict_test(
     name = "linalg_ops_test",
     size = "medium",
     srcs = ["linalg_ops_test.py"],
-    shard_count = 8,
+    shard_count = 20,
     tags = ["no_windows_gpu"],
     deps = [
         "//tensorflow/python/eager:def_function",
@@ -256,7 +256,7 @@ cuda_py_strict_test(
     name = "linear_operator_composition_test",
     size = "medium",
     srcs = ["linear_operator_composition_test.py"],
-    shard_count = 5,
+    shard_count = 20,  # TSAN shards time out at 5, b/582488646
     tags = [
         "optonly",  # times out
     ],
@@ -632,7 +632,9 @@ tf_py_strict_test(
     tags = ["no_windows_gpu"],
     deps = [
         "//tensorflow/python/client:session",
+        "//tensorflow/python/eager:def_function",
         "//tensorflow/python/framework:constant_op",
+        "//tensorflow/python/framework:dtypes",
         "//tensorflow/python/framework:for_generated_wrappers",
         "//tensorflow/python/framework:test_lib",
         "//tensorflow/python/ops:array_ops",
@@ -696,6 +698,7 @@ cuda_py_strict_test(
     name = "matrix_solve_ls_op_test",
     size = "medium",
     srcs = ["matrix_solve_ls_op_test.py"],
+    shard_count = 8,
     deps = [
         "//tensorflow/python/client:session",
         "//tensorflow/python/eager:context",
@@ -793,11 +796,14 @@ cuda_py_strict_test(
     # TODO(b/208263392): Re-enable. tf.Squeeze op after tf.Where op doesn't reshape.
     xla_enable_strict_auto_jit = False,
     deps = [
+        "//tensorflow/python/eager:backprop",
         "//tensorflow/python/eager:def_function",
         "//tensorflow/python/framework:constant_op",
+        "//tensorflow/python/framework:dtypes",
         "//tensorflow/python/framework:test_lib",
         "//tensorflow/python/ops:array_ops",
         "//tensorflow/python/ops:linalg_ops",
+        "//tensorflow/python/ops:nn_impl",
         "//tensorflow/python/platform:client_testlib",
         "//third_party/py/numpy",
         "@absl_py//absl/testing:parameterized",
@@ -945,6 +951,7 @@ cuda_py_strict_test(
         "//tensorflow/python/eager:backprop",
         "//tensorflow/python/eager:context",
         "//tensorflow/python/framework:constant_op",
+        "//tensorflow/python/framework:errors",
         "//tensorflow/python/framework:for_generated_wrappers",
         "//tensorflow/python/framework:test_lib",
         "//tensorflow/python/ops:array_ops",

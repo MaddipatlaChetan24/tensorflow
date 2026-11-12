@@ -162,6 +162,18 @@ def full_like(a, fill_value, dtype=None, order='K', subok=True, shape=None):  # 
   return array_ops.broadcast_to(fill_value, array_ops.shape(a))
 
 
+def _cast(x, dtype, name=None):
+  """Casts `x` to `dtype`, testing complex values against zero for bool.
+
+  `math_ops.cast` keeps only the real part of a complex tensor, so `-3j` would
+  become `False`. NumPy treats a complex value as true if either part is
+  nonzero.
+  """
+  if x.dtype.is_complex and dtypes.as_dtype(dtype) == dtypes.bool:
+    return math_ops.not_equal(x, 0, name=name)
+  return math_ops.cast(x, dtype, name=name)
+
+
 def _array_internal(val, dtype=None, copy=True, ndmin=0):  # pylint: disable=redefined-outer-name
   """Main implementation of np.array()."""
   result_t = val
@@ -181,9 +193,9 @@ def _array_internal(val, dtype=None, copy=True, ndmin=0):  # pylint: disable=red
     # supply that information so that convert_to_tensor will do best-effort
     # conversion to that dtype first.
     result_t = np_arrays.convert_to_tensor(result_t, dtype_hint=dtype)
-    result_t = math_ops.cast(result_t, dtype=dtype)
+    result_t = _cast(result_t, dtype)
   elif dtype:
-    result_t = math_ops.cast(result_t, dtype)
+    result_t = _cast(result_t, dtype)
 
   if copy:
     result_t = array_ops.identity(result_t)
@@ -365,6 +377,11 @@ def diagonal(a, offset=0, axis1=0, axis2=1):  # pylint: disable=missing-docstrin
   a = asarray(a)
 
   maybe_rank = a.shape.rank
+  if maybe_rank is not None and maybe_rank < 2:
+    # NumPy checks the rank before any per-axis checks, so a rank-0 or
+    # rank-1 input gets this message instead of the out-of-bounds or
+    # same-axis errors below. `trace` inherits this check.
+    raise ValueError('diag requires an array of at least two dimensions')
   if (
       maybe_rank is not None
       and isinstance(axis1, (int, np.integer))
@@ -383,7 +400,7 @@ def diagonal(a, offset=0, axis1=0, axis2=1):  # pylint: disable=missing-docstrin
           f'for input of rank {maybe_rank}.'
       )
     if norm1 == norm2:
-      raise ValueError('axis1 and axis2 cannot be the same axis')
+      raise ValueError('axis1 and axis2 cannot be the same')
     # Reassign after validation so the error messages above keep the
     # original user-supplied values and the fast path below consumes
     # normalized, non-negative axes.
@@ -526,9 +543,9 @@ def copy(a):
 
 
 def _maybe_promote_to_int(a):
-  if dtypes.as_dtype(a.dtype).is_integer:
-    # If a is an integer type and its precision is less than that of `int`,
-    # the output type will be `int`.
+  if dtypes.as_dtype(a.dtype).is_integer or a.dtype == dtypes.bool:
+    # If a is a bool or an integer type whose precision is less than that of
+    # `int`, the output type will be `int`.
     a_numpy_dtype = a.dtype.as_numpy_dtype
     output_type = np.promote_types(a_numpy_dtype, int)
     if output_type != a_numpy_dtype:
@@ -831,7 +848,7 @@ def var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=None):  # pylint: d
       )
 
       if axis is None:
-        n = array_ops.size(input_tensor)
+        n = array_ops.size(input_tensor, out_type=dtypes.int64)
       else:
         # axis can be an int or a sequence of ints.
         if isinstance(axis, (int, np.integer)):
@@ -854,9 +871,25 @@ def var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=None):  # pylint: d
               axis < 0, axis + array_ops.rank(input_tensor), axis
           )
         n = math_ops.reduce_prod(
-            array_ops.gather(array_ops.shape(input_tensor), axis)
+            array_ops.gather(
+                array_ops.shape(input_tensor, out_type=dtypes.int64), axis
+            )
         )
-      n = math_ops.cast(n - ddof, squared_deviations.dtype)
+      # NumPy clamps the degrees-of-freedom denominator at 0 (and emits a
+      # "Degrees of freedom <= 0" RuntimeWarning) when ddof >= n, rather than
+      # letting it go negative, and it also allows a non-integer `ddof`
+      # (e.g. 1.5). Casting both `n` and `ddof` to `squared_deviations.dtype`
+      # before subtracting avoids a TypeError from mixing an integer `n`
+      # with a float `ddof`, and the `maximum(..., 0)` clamp turns a
+      # would-be negative denominator into 0 (giving NumPy's `inf` on
+      # divide) instead of a finite, wrong, negative "variance". `n` is
+      # computed as int64 above so it doesn't silently overflow on tensors
+      # with more than 2**31 - 1 elements.
+      n = math_ops.cast(n, squared_deviations.dtype)
+      ddof_cast = math_ops.cast(ddof, squared_deviations.dtype)
+      n = math_ops.maximum(
+          n - ddof_cast, math_ops.cast(0, squared_deviations.dtype)
+      )
 
       return math_ops.divide(squared_deviations, n)
 
@@ -902,6 +935,9 @@ def real(val):
   val = asarray(val)
   # TODO(srbs): np.real returns a scalar if val is a scalar, whereas we always
   # return an ndarray.
+  if val.dtype == dtypes.bool:
+    # `math_ops.real` rejects bool, which is already real.
+    return val
   return math_ops.real(val)
 
 
@@ -921,6 +957,32 @@ def repeat(a, repeats, axis=None):  # pylint: disable=missing-docstring
           f'for input of rank {maybe_rank}.'
       )
     axis = normalized
+  # NumPy raises ValueError for negative `repeats` entries before any
+  # computation instead of failing in the Tile kernel with an
+  # InvalidArgumentError, with a distinct message for broadcast (scalar or
+  # size-1) and sequence `repeats`. Only signed-integer Python or NumPy
+  # values are inspected, so floats, strings, unsigned entries, and Tensor
+  # `repeats` keep their backend behavior.
+  np_repeats_check = None
+  if isinstance(repeats, (int, np.integer)):
+    if repeats < 0:
+      raise ValueError('negative dimensions are not allowed')
+  elif not isinstance(repeats, core_tf_types.Tensor):
+    try:
+      np_repeats_check = np.asarray(repeats)
+    except (TypeError, ValueError, NotImplementedError):
+      # Ragged input or symbolic Tensor sequence: leave it to the backend.
+      np_repeats_check = None
+    if (
+        np_repeats_check is not None
+        and np_repeats_check.ndim <= 1
+        and np.issubdtype(np_repeats_check.dtype, np.signedinteger)
+    ):
+      if np_repeats_check.size == 1:
+        if np_repeats_check.item() < 0:
+          raise ValueError('negative dimensions are not allowed')
+      elif (np_repeats_check < 0).any():
+        raise ValueError('repeats may not contain negative values.')
   original_shape = a._shape_as_list()  # pylint: disable=protected-access
   # Best effort recovery of the shape.
   known_shape = original_shape is not None and None not in original_shape
@@ -928,7 +990,11 @@ def repeat(a, repeats, axis=None):  # pylint: disable=missing-docstring
     if not original_shape:
       original_shape = (repeats,)
     else:
-      repeats_np = np.ravel(np.array(repeats))
+      repeats_np = np.ravel(
+          np_repeats_check
+          if np_repeats_check is not None
+          else np.array(repeats)
+      )
       if repeats_np.size == 1:
         repeats_np = repeats_np.item()
         if axis is None:
@@ -949,14 +1015,25 @@ def repeat(a, repeats, axis=None):  # pylint: disable=missing-docstring
   return result
 
 
+_AROUND_MAX_DECIMALS = {
+    dtypes.float16: 4,
+    dtypes.bfloat16: 38,
+    dtypes.float32: 38,
+    dtypes.float64: 308,
+}
+
+
 @tf_export.tf_export('experimental.numpy.around', v1=[])
 @np_utils.np_doc('around')
 def around(a, decimals=0):  # pylint: disable=missing-docstring
   a = asarray(a)
   dtype = a.dtype.as_numpy_dtype
-  factor = math.pow(10, decimals)
+  if a.dtype.is_integer and decimals >= 0:
+    # Integers are already rounded to any non-negative number of decimals.
+    # Going through a float dtype would also lose precision above 2**53.
+    return a
   if np.issubdtype(dtype, np.inexact):
-    factor = math_ops.cast(factor, dtype)
+    float_dtype = dtype
   else:
     # Use float as the working dtype when a.dtype is exact (e.g. integer),
     # because `decimals` can be negative.
@@ -965,10 +1042,18 @@ def around(a, decimals=0):  # pylint: disable=missing-docstring
     # has been called, and is an alias of `math_ops.cast`; calling `cast`
     # directly keeps `around` working without that opt-in.
     a = math_ops.cast(a, float_dtype)
-    factor = math_ops.cast(factor, float_dtype)
-  a = math_ops.multiply(a, factor)
-  a = math_ops.round(a)
-  a = math_ops.divide(a, factor)
+  max_decimals = _AROUND_MAX_DECIMALS.get(
+      dtypes.as_dtype(float_dtype).real_dtype, 308
+  )
+  if decimals > max_decimals:
+    return math_ops.cast(a, dtype)
+  if decimals < -max_decimals:
+    return array_ops.zeros_like(a, dtype=dtype)
+  factor = constant_op.constant(math.pow(10, abs(decimals)), float_dtype)
+  if decimals >= 0:
+    a = math_ops.divide(math_ops.round(math_ops.multiply(a, factor)), factor)
+  else:
+    a = math_ops.multiply(math_ops.round(math_ops.divide(a, factor)), factor)
   return math_ops.cast(a, dtype)
 
 
@@ -1204,6 +1289,11 @@ def moveaxis(a, source, destination):  # pylint: disable=missing-docstring
       and builtins.all(isinstance(x, (int, np.integer)) for x in source)
       and builtins.all(isinstance(x, (int, np.integer)) for x in destination)
   ):
+    # NumPy rejects a repeated axis in `source` or `destination`.
+    if len(set(source)) != len(source):
+      raise ValueError('repeated axis in `source` argument')
+    if len(set(destination)) != len(destination):
+      raise ValueError('repeated axis in `destination` argument')
     perm = [i for i in range(a_rank) if i not in source]
     for dest, src in sorted(zip(destination, source)):
       assert dest <= len(perm)
@@ -1251,6 +1341,112 @@ def pad(array, pad_width, mode, **kwargs):  # pylint: disable=redefined-outer-na
     raise ValueError('Unsupported padding mode: ' + mode)
   mode = mode.upper()
   array = asarray(array)
+  # NumPy requires `pad_width` entries to be integral and rejects negative
+  # ones before any computation, and broadcasts `pad_width` against the
+  # input rank (scalar, pair, single-pair, (1, 1), and (rank, 1) forms all
+  # pad every axis; a 0-d array has zero axes to pad, so every `pad_width`
+  # broadcastable to (0, 2) leaves it unchanged). The backend `pad`
+  # instead requires an exact (rank, 2) paddings tensor, so the other
+  # forms fail with a confusing InvalidArgumentError, and float entries
+  # were previously silently truncated to int32. Mirror NumPy's semantics
+  # for Python/NumPy values; `pad_width` containing a Tensor keeps the
+  # previous behavior, except that a bare Tensor also expands its
+  # scalar/single-entry/pair/(1, 1)/(rank, 1) forms for a statically-known
+  # rank. Every `pad_width` for a 0-d input is broadcast to (0, 2) before
+  # the backend call, so Tensor values are validated there instead of
+  # skipping the backend's shape check; ragged values raise up front. With
+  # an unknown input rank, the dtype and negative checks still run and only
+  # the broadcast step is skipped.
+  maybe_rank = array.shape.rank
+  if isinstance(pad_width, core_tf_types.Tensor):
+    # A bare Tensor cannot contain nested tensors, so skip the
+    # `nest.flatten` scan of the Python branch below.
+    width_shape = pad_width.shape
+    if maybe_rank is not None and width_shape.rank is not None:
+      if width_shape.rank == 0 or (
+          width_shape.rank == 1 and width_shape[0] in (1, 2)
+      ):
+        # Scalar, single-entry, or bare pair: NumPy broadcasts such
+        # sequences against every axis before padding, so expand the
+        # Tensor with the same broadcast rules.
+        pad_width = array_ops.broadcast_to(pad_width, (maybe_rank, 2))
+      elif (
+          width_shape.rank == 2 and width_shape[0] == 1 and width_shape[1] == 2
+      ):
+        # A single pair in a sequence: tile it across the axes.
+        pad_width = array_ops.tile(pad_width, [maybe_rank, 1])
+      elif (
+          width_shape.rank == 2
+          and width_shape[1] == 1
+          and width_shape[0] in (1, maybe_rank)
+      ):
+        # (1, 1), (rank, 1), or a single row: NumPy broadcasts each
+        # entry across (before, after).
+        pad_width = array_ops.broadcast_to(pad_width, (maybe_rank, 2))
+      if maybe_rank == 0:
+        # `tf.broadcast_to` reports a shape mismatch as InvalidArgumentError
+        # in eager mode, so validate a known static shape here and raise
+        # ValueError like NumPy instead. `broadcast_shapes` checks metadata
+        # only, so no buffer is allocated, and its output rank is the larger
+        # input rank, so every rank > 2 shape fails to reach (0, 2).
+        static_shape = pad_width.shape.as_list()
+        if None not in static_shape:
+          try:
+            ok = np.broadcast_shapes(static_shape, (0, 2)) == (0, 2)
+          except ValueError:
+            ok = False
+          if not ok:
+            raise ValueError(
+                '`pad_width` with shape %s cannot be broadcast to (0, 2) '
+                'for a 0-d array.' % static_shape
+            )
+    # Other Tensor shapes, including the exact (rank, 2), go to the
+    # backend unchanged, as before.
+  elif not (
+      isinstance(pad_width, (list, tuple))
+      and builtins.any(
+          isinstance(v, core_tf_types.Tensor) for v in nest.flatten(pad_width)
+      )
+  ):
+    # Symbolic tensors inside a nested list cannot be converted with
+    # `np.asarray` under tracing, and eager tensors would be copied to the
+    # host, so only plain Python/NumPy values are inspected here.
+    try:
+      np_pw = np.asarray(pad_width)
+    except (TypeError, ValueError):
+      # Ragged input: NumPy rejects it too. A 0-d input skips the backend
+      # below, so surface NumPy's error here; otherwise leave it to the
+      # backend's "inhomogeneous shape" path.
+      if maybe_rank == 0:
+        raise
+      np_pw = None
+    if np_pw is not None:
+      if not np.issubdtype(np_pw.dtype, np.integer):
+        raise TypeError('`pad_width` must be of integral type.')
+      if (np_pw < 0).any():
+        raise ValueError("index can't contain negative values")
+      if maybe_rank is not None:
+        if maybe_rank == 0:
+          # NumPy raises ValueError at its per-axis broadcast for shapes
+          # that do not broadcast to (0, 2); replicate it instead of
+          # leaving the shape to the backend, which cannot handle a 0-d
+          # input at all.
+          np.broadcast_to(np_pw, (0, 2))
+        else:
+          try:
+            pad_width = np.broadcast_to(np_pw, (maybe_rank, 2))
+          except ValueError:
+            # Not broadcastable (e.g. shape (2, 2) on a rank-3 input):
+            # leave it to the backend's shape error.
+            pass
+  if maybe_rank == 0:
+    # NumPy has zero axes to pad on a 0-d input, so every `pad_width`
+    # broadcastable to (0, 2) leaves the array unchanged. Broadcast rather
+    # than returning the input here so Tensor and ragged values are still
+    # validated instead of skipping the shape check entirely.
+    pad_width = array_ops.broadcast_to(
+        asarray(pad_width, dtype=dtypes.int32), (0, 2)
+    )
   pad_width = asarray(pad_width, dtype=dtypes.int32)
   return array_ops.pad(
       tensor=array,
@@ -1612,7 +1808,7 @@ def nonzero(a):
         'arrays to return.'
     )
   return array_ops_stack.unstack(
-      array_ops.where_v2(math_ops.cast(a, dtypes.bool)), a.shape.rank, axis=1
+      array_ops.where_v2(_cast(a, dtypes.bool)), a.shape.rank, axis=1
   )
 
 
@@ -1730,12 +1926,24 @@ def flip(m, axis=None):  # pylint: disable=missing-docstring
 @tf_export.tf_export('experimental.numpy.flipud', v1=[])
 @np_utils.np_doc('flipud')
 def flipud(m):  # pylint: disable=missing-docstring
+  m = asarray(m)
+  maybe_rank = m.shape.rank
+  if maybe_rank is not None and maybe_rank < 1:
+    # Match np.flipud: raise a ValueError instead of letting the C++ reverse
+    # kernel fail with a confusing out-of-range axis error.
+    raise ValueError('Input must be >= 1-d.')
   return flip(m, 0)
 
 
 @tf_export.tf_export('experimental.numpy.fliplr', v1=[])
 @np_utils.np_doc('fliplr')
 def fliplr(m):  # pylint: disable=missing-docstring
+  m = asarray(m)
+  maybe_rank = m.shape.rank
+  if maybe_rank is not None and maybe_rank < 2:
+    # Match np.fliplr: raise a ValueError instead of letting the C++ reverse
+    # kernel fail with a confusing out-of-range axis error.
+    raise ValueError('Input must be >= 2-d.')
   return flip(m, 1)
 
 

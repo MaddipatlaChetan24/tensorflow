@@ -32,6 +32,7 @@ limitations under the License.
 #include "mlir/IR/BuiltinTypes.h"  // from @llvm-project
 #include "mlir/IR/Diagnostics.h"  // from @llvm-project
 #include "mlir/IR/DialectResourceBlobManager.h"  // from @llvm-project  // IWYU pragma: keep
+#include "mlir/IR/OpDefinition.h"  // from @llvm-project
 #include "mlir/IR/Operation.h"  // from @llvm-project
 #include "mlir/IR/PatternMatch.h"  // from @llvm-project
 #include "mlir/IR/Value.h"  // from @llvm-project
@@ -44,6 +45,7 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/lite/ir/tfl_ops.h"
 #include "tensorflow/compiler/mlir/lite/transforms/lower_quant_annotations_helper.h"
 #include "tensorflow/compiler/mlir/lite/transforms/passes.h"  // IWYU pragma: keep
+#include "tensorflow/compiler/mlir/lite/transforms/quantization/quant_utils.h"
 #include "tensorflow/compiler/mlir/lite/utils/utils.h"
 #include "tensorflow/compiler/mlir/tensorflow/ir/tf_ops.h"
 
@@ -100,10 +102,12 @@ LogicalResult ReadNumericElements(ElementsAttr attr,
   if (blob == nullptr) return failure();
 
   const Type element_type = dense_resource.getType().getElementType();
-  if (element_type.isF32()) {
-    AppendBlobAs<float>(blob, out);
-  } else if (element_type.isF64()) {
-    AppendBlobAs<double>(blob, out);
+  if (mlir::isa<FloatType>(element_type)) {
+    // f16, bf16, f32 and f64 (shared with the bias quantizer).
+    std::optional<SmallVector<double>> values =
+        ReadFloatElementsAsDoubles(attr);
+    if (!values.has_value()) return failure();
+    out.append(values->begin(), values->end());
   } else if (element_type.isInteger(8)) {
     AppendBlobAs<int8_t>(blob, out);
   } else if (element_type.isInteger(16)) {
@@ -395,6 +399,48 @@ class RewriteQuantizeCompositeOp
   }
 };
 
+// Returns true if `op` only moves or copies the elements of its operands, so
+// its result element type has to match theirs.
+static bool IsElementTypePreservingOp(mlir::Operation* op) {
+  return isa<stablehlo::TransposeOp, stablehlo::ReshapeOp,
+             stablehlo::BroadcastInDimOp, stablehlo::SliceOp,
+             stablehlo::ConcatenateOp>(op);
+}
+
+// Returns true if `op` is a chain of element type preserving ops over
+// constants that should have been folded into a constant. Retyping its result
+// to a quantized type would leave its integer operands mismatched.
+static bool IsUnfoldedConstantTransform(mlir::Operation* op) {
+  if (!IsElementTypePreservingOp(op)) return false;
+  for (mlir::Value operand : op->getOperands()) {
+    mlir::Operation* def_op = operand.getDefiningOp();
+    if (def_op == nullptr) return false;
+    if (def_op->hasTrait<OpTrait::ConstantLike>()) continue;
+    if (!IsUnfoldedConstantTransform(def_op)) return false;
+  }
+  return true;
+}
+
+// Returns the op producing the quantized input of a quant.dequantize
+// annotation if it is an unfolded transform of a constant, or null otherwise.
+static mlir::Operation* GetUnfoldedDequantizeProducer(mlir::Operation* op) {
+  llvm::StringRef name;
+  if (auto composite_op = dyn_cast<stablehlo::CompositeOp>(op)) {
+    name = composite_op.getName();
+  } else if (auto custom_call_op = dyn_cast<stablehlo::CustomCallOp>(op)) {
+    name = custom_call_op.getCallTargetName();
+  } else {
+    return nullptr;
+  }
+  if (name != "quant.dequantize" || op->getNumOperands() == 0) return nullptr;
+  mlir::Operation* producer_op =
+      op->getOperand(op->getNumOperands() - 1).getDefiningOp();
+  if (producer_op && IsUnfoldedConstantTransform(producer_op)) {
+    return producer_op;
+  }
+  return nullptr;
+}
+
 static func::FuncOp GetEnclosingFunction(mlir::Operation* op) {
   while (op) {
     // Check if the current operation is a function.
@@ -546,6 +592,11 @@ class RewriteDequantizeCompositeOp
         // If it has no other uses, the cleanup pass (DCE) will remove it
         // automatically.
 
+      } else if (producer_op && IsUnfoldedConstantTransform(producer_op)) {
+        // Reported after pattern application; see
+        // `GetUnfoldedDequantizeProducer`.
+        return rewriter.notifyMatchFailure(
+            composite_op, "dequantize input is produced by an unfolded op");
       } else if (producer_op) {
         // Fallback for dynamic/non-constant inputs: update the producer's type
         // directly
@@ -903,6 +954,11 @@ void LowerQuantAnnotationsPass::runOnOperation() {
               value_attr);
 
           tfl_quantize_input = qconst_op.getResult();
+        } else if (producer_op && IsUnfoldedConstantTransform(producer_op)) {
+          // Reported after pattern application; see
+          // `GetUnfoldedDequantizeProducer`.
+          return rewriter.notifyMatchFailure(
+              custom_call_op, "dequantize input is produced by an unfolded op");
         } else if (producer_op) {
           rewriter.startOpModification(producer_op);
           for (OpResult result : producer_op->getResults()) {
@@ -1009,6 +1065,27 @@ void LowerQuantAnnotationsPass::runOnOperation() {
           applyPatternsGreedily(module, std::move(patterns), greedy_config))) {
     getOperation().emitError("Composite lowering pass failed.");
     signalPassFailure();
+  }
+
+  // A quant.dequantize whose input comes from an op that only moves elements
+  // around (e.g. a transpose of an integer weight) can only be lowered once
+  // that op is folded into a constant. Fail with a clear message rather than
+  // leaving it for later passes, which would report an unrelated error.
+  bool has_unfolded_dequantize_input = false;
+  module.walk([&](mlir::Operation* op) {
+    if (mlir::Operation* producer_op = GetUnfoldedDequantizeProducer(op)) {
+      op->emitError()
+          << "the input of quant.dequantize must be a constant, but it is "
+             "produced by '"
+          << producer_op->getName() << "' with operand type "
+          << producer_op->getOperand(0).getType()
+          << ", which was not folded into a constant";
+      has_unfolded_dequantize_input = true;
+    }
+  });
+  if (has_unfolded_dequantize_input) {
+    signalPassFailure();
+    return;
   }
 
   RewritePatternSet cleanup_patterns(&ctx);
