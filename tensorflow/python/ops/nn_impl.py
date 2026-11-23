@@ -1479,7 +1479,7 @@ def moments(
    * for simple batch normalization pass `axes=[0]` (batch only).
 
   Args:
-    x: A `Tensor`.
+    x: A `Tensor` or array-like.
     axes: Array of ints.  Axes along which to compute mean and
       variance.
     shift: Not used in the current implementation
@@ -1509,6 +1509,7 @@ def moments(
     # `weighted_moments` already does (GitHub issues #129819, #101580).
     axes = axes.tolist()
   with ops.name_scope(name, "moments", [x, axes]):
+    x = ops.convert_to_tensor(x, name="x")
     # The dynamic range of fp16 is too limited to support the collection of
     # sufficient statistics. As a workaround we simply perform the operations
     # on 32-bit floats before converting the mean and variance back to fp16

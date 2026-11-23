@@ -1284,6 +1284,16 @@ class MomentsTest(test_lib.TestCase):
               self.assertAllClose(mean, expected_mean, rtol=tol, atol=tol)
               self.assertAllClose(variance, expected_var, rtol=tol, atol=tol)
 
+  def testArrayLikeInput(self):
+    values = [[1., 2.], [3., 4.]]
+    for x in (values, np.array(values)):
+      mean, variance = nn_impl.moments_v2(x, [0])
+      self.assertAllClose(mean, [2., 3.])
+      self.assertAllClose(variance, [1., 1.])
+    mean, variance = nn_impl.moments_v2([[1, 2], [3, 4]], [0])
+    self.assertAllClose(mean, [2, 3])
+    self.assertAllClose(variance, [1, 1])
+
   def testOutputAndGradient2DInput0(self):
     self.doOutputTest((10, 10), (0,), check_gradients=True)
 
